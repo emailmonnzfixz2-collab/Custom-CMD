@@ -1,0 +1,109 @@
+#!/system/bin/sh
+# ------------------------------------------------------------------
+# ZynxOpt All-in-One CMD Manager
+# Copyright (c) 2026 By Monnz
+# ------------------------------------------------------------------
+
+# --- MANTRA INVISIBLE ---
+taskset -p ff $$ >/dev/null 2>&1
+renice -n 19 -p $$ >/dev/null 2>&1
+ionice -c 3 -p $$ >/dev/null 2>&1
+iorenice $$ 7 idle >/dev/null 2>&1
+
+GLOBAL_KEY="database"
+
+show_help() {
+    echo "Game Opt Manager (gameopt) commands:"
+    echo "  help"
+    echo "      Print this help text."
+    echo ""
+    echo "  set-mode [-m MODE] [standard|performance|battery] <PACKAGE_NAME>"
+    echo "    Changes the performance profile for a specific package."
+    echo ""
+    echo "  get-mode <PACKAGE_NAME>"
+    echo "    Display the current optimization mode for the package."
+    echo ""
+    echo "  list-apps"
+    echo "    Show all packages currently optimized."
+    echo ""
+}
+
+run_opt() {
+    local MODE=$1
+    local PKG=$2
+    
+    if [ -z "$PKG" ]; then
+        echo "Error: Missing Package Name!"
+        return 1
+    fi
+
+    if ! pm list packages | grep -q "^package:$PKG$"; then
+        echo "Error: Package '$PKG' tidak ditemukan!"
+        return 1
+    fi
+
+    local OLD_DATA=$(settings get global $GLOBAL_KEY 2>/dev/null)
+    [ "$OLD_DATA" = "null" ] && OLD_DATA=""
+    local CLEAN_DATA=$(echo "$OLD_DATA" | sed "s|$PKG=[^,]*|,|g; s|,,|,|g; s|^,||")
+    local NEW_DATA="${CLEAN_DATA}${PKG}=${MODE},"    
+    settings put global $GLOBAL_KEY "$NEW_DATA"
+    
+    local PID=$(pidof "$PKG")
+    if [ ! -z "$PID" ]; then
+        case "$MODE" in
+            "optimizer")
+                renice -n -20 -p $PID >/dev/null 2>&1
+                taskset -p f0 $PID >/dev/null 2>&1
+                echo "Result: Optimizer Active."
+                ;;
+            "battery")
+                renice -n 15 -p $PID >/dev/null 2>&1
+                taskset -p 0f $PID >/dev/null 2>&1
+                echo "Result: Battery Active."
+                ;;
+            "balance")
+                renice -n 0 -p $PID >/dev/null 2>&1
+                taskset -p ff $PID >/dev/null 2>&1
+                echo "Result: Balance Active."
+                ;;
+        esac
+    fi
+    echo "Success"
+}
+
+get_mode() {
+    local PKG=$1
+    local DATA=$(settings get global $GLOBAL_KEY 2>/dev/null)
+    local MODE=$(echo "$DATA" | grep -o "$PKG=[^,]*" | cut -d'=' -f2)
+    if [ -z "$MODE" ]; then
+        echo "No profile for $PKG"
+    else
+        echo "$PKG: $MODE"
+    fi
+}
+
+list_apps() {
+    echo "Optimized Packages:"
+    local DATA=$(settings get global $GLOBAL_KEY 2>/dev/null)
+    if [ -z "$DATA" ] || [ "$DATA" = "null" ]; then
+        echo "  (None)"
+    else
+        echo "$DATA" | tr ',' '\n' | grep "=" | while read -r line; do
+            echo "  - ${line%=*} [${line#*=}]"
+        done
+    fi
+}
+
+# --- SMART WRAPPER ---
+if [ "$1" == "gameopt" ] || [ "$1" == "pkgopt" ]; then
+    shift
+    case "$1" in
+        "help" | "") show_help ;;
+        "set-mode" | "-m") run_opt "$2" "$3" ;;
+        "get-mode" | "-get") get_mode "$2" ;;
+        "list-apps" | "-list") list_apps ;;
+        *) echo "Unknown gameopt command: $1" ;;
+    esac
+else
+    exec /system/bin/cmd "$@"
+fi

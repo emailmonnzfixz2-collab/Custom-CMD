@@ -1,0 +1,161 @@
+#!/system/bin/sh
+
+# ----------------- CONFIG & INITIALIZATION -----------------
+COMMAND="$1"
+SDK=$(getprop ro.build.version.sdk)
+GLOBAL_KEY="database"
+
+run_mode() {
+    local MODE="$1"
+    local PKG="$2"
+
+    if [ -z "$MODE" ]; then
+        echo "Error: mode not found!"
+        return 1
+    fi
+
+    if [ -z "$PKG" ]; then
+        echo "Error: missing package name!"
+        return 1
+    fi
+
+    if ! pm list packages | grep -qw "package:$PKG"; then
+        echo "Error: Package '$PKG' not found in device!"
+        return 1
+    fi
+
+    local UID=$(dumpsys package "$PKG" | grep "userId=" | cut -d'=' -f2 | cut -d' ' -f1)
+    local DATA=$(settings get global "$GLOBAL_KEY" | sed 's/null//')
+    local CLEAN_DATA=$(echo "$DATA" | sed "s|$PKG=[^,]*|,|g; s|,,|,|g; s|^,||")
+    local NEW_DATA="${CLEAN_DATA}${PKG}=${MODE},"
+    settings put global "$GLOBAL_KEY" "$NEW_DATA"
+    local PKG_LIST=""
+    local ITEMS=$(echo "$NEW_DATA" | tr ',' ' ')
+    for entry in $ITEMS; do
+        if echo "$entry" | grep -q "="; then
+            local NAME=$(echo "$entry" | cut -d'=' -f1)
+            
+            if [ -z "$PKG_LIST" ]; then
+                PKG_LIST="$NAME"
+            else
+                PKG_LIST="$PKG_LIST,$NAME"
+            fi
+        fi
+    done
+    case "$MODE" in
+        "standart"|"1")
+            cmd package compile -m verify -f "$PKG" &>/dev/null 2>&1
+            cmd appops set "$PKG" RUN_IN_BACKGROUND default >/dev/null 2>&1
+            cmd appops set "$PKG" RUN_ANY_IN_BACKGROUND default >/dev/null 2>&1
+            cmd appops set "$PKG" WAKE_LOCK default >/dev/null 2>&1
+            cmd activity set-standby-bucket "$PKG" working_set >/dev/null 2>&1
+            cmd activity set-inactive "$PKG" true >/dev/null 2>&1
+            cmd netpolicy remove restrict-background-whitelist "$UID" >/dev/null 2>&1
+            cmd deviceidle whitelist -"$PKG" >/dev/null 2>&1
+            cmd power set-fixed-performance-mode-enabled false
+            cmd power set-adaptive-power-saver-enabled false
+            echo "Success"
+            ;;
+        "performance"|"2")
+            cmd package compile -m speed -f "$PKG" &>/dev/null 2>&1
+            cmd package compile --compile-layouts --secondary-dex "$PKG" >/dev/null 2>&1
+            cmd appops set "$PKG" RUN_IN_BACKGROUND allow >/dev/null 2>&1
+            cmd appops set "$PKG" RUN_ANY_IN_BACKGROUND allow >/dev/null 2>&1
+            cmd appops set "$PKG" WAKE_LOCK allow >/dev/null 2>&1
+            cmd activity set-standby-bucket "$PKG" active >/dev/null 2>&1
+            cmd activity set-inactive "$PKG" false >/dev/null 2>&1
+            cmd netpolicy add restrict-background-whitelist "$UID" >/dev/null 2>&1
+            cmd deviceidle whitelist +"$PKG" >/dev/null 2>&1
+            cmd power set-fixed-performance-mode-enabled true
+            cmd power set-adaptive-power-saver-enabled false
+            if [ "$SDK" -ge 31 ]; then
+                settings put global updatable_driver_production_opt_in_apps "$PKG_LIST"
+                settings put global updatable_driver_production_opt_out_apps 1
+            else
+                settings put global game_driver_opt_in_apps "$PKG_LIST"
+                settings put global game_driver_opt_out_apps 1
+            fi
+            echo "Success"
+            ;;
+        "battery"|"3")
+            cmd package compile -m space -f "$PKG" &>/dev/null 2>&1
+            cmd appops set "$PKG" RUN_IN_BACKGROUND ignore >/dev/null 2>&1
+            cmd appops set "$PKG" RUN_ANY_IN_BACKGROUND ignore >/dev/null 2>&1
+            cmd appops set "$PKG" WAKE_LOCK ignore >/dev/null 2>&1
+            cmd activity set-standby-bucket "$PKG" rare >/dev/null 2>&1
+            cmd activity set-inactive "$PKG" true >/dev/null 2>&1
+            cmd netpolicy remove restrict-background-whitelist "$UID" >/dev/null 2>&1
+            cmd deviceidle whitelist -"$PKG" >/dev/null 2>&1
+            cmd power set-fixed-performance-mode-enabled false
+            cmd power set-adaptive-power-saver-enabled true
+            echo "Success"
+            ;;
+        *)
+            echo "Unknown mode $MODE!, Please usage [1|2|3|standart|performance|battery]"
+            ;;
+        esac
+}
+
+get_mode() {
+    local PKG="$1"
+    if [ -z "$PKG" ]; then
+        echo "Error: Masukkan nama package!"
+        return 1
+    fi
+    local DATA=$(settings get global "$GLOBAL_KEY" 2>/dev/null)
+    local VAL=$(echo "$DATA" | grep -o "$PKG=[^,]*" | cut -d'=' -f2)
+    
+    if [ -z "$VAL" ]; then
+        echo "No profil for $PKG"
+    else
+        echo "$PKG: $VAL"
+    fi
+}
+
+list_apps() {
+    echo "Optimized Packages:"
+    local DATA=$(settings get global $GLOBAL_KEY 2>/dev/null)
+    if [ -z "$DATA" ] || [ "$DATA" = "null" ]; then
+        echo "  (None)"
+    else
+        echo "$DATA" | tr ',' '\n' | grep "=" | while read -r line; do
+            if [ -n "$line" ]; then
+                echo "  - ${line%=*} [${line#*=}]"
+            fi
+        done
+    fi
+}
+
+case "$COMMAND" in
+    "set-mode"|"-m")
+        run_mode $2 $3
+    ;;
+    "get-mode"|"-g")
+        get_mode $2
+    ;;
+    "list-apps"|"-l")
+        list_apps
+    ;;
+    "help"|"-help"|"")
+        echo "Game Opt Manager (gameopt) commands:"
+        echo "  help"
+        echo "      Print this help text."
+        echo ""
+        echo "  set-mode [-m MODE] [1|2|3|standart|performance|battery] <PACKAGE_NAME>"
+        echo "    Changes the performance profile for a specific package."
+        echo "    Mode must be one of:"
+        echo "      standart:   Standart performance and power consumption."
+        echo "      performance: Advanced performance for gaming."
+        echo "      battery:   Power saving mode to extend battery life."
+        echo ""
+        echo "  get-mode | -g <PACKAGE_NAME>"
+        echo "    Display the current optimization mode for the package."
+        echo ""
+        echo "  list-apps | -l"
+        echo "    Show all packages currently optimized by pkgopt."
+        echo ""
+        ;;
+    *)
+        echo "Unknown gameopt command: $1"
+        ;;
+    esac

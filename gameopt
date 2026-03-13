@@ -102,6 +102,10 @@ get_mode() {
         echo "Error: missing package name!"
         return 1
     fi
+    if ! pm list packages | grep -qw "package:$PKG"; then
+        echo "Error: Package '$PKG' not found in device!"
+        return 1
+    fi
     local DATA=$(settings get global "$GLOBAL_KEY" 2>/dev/null)
     local VAL=$(echo "$DATA" | grep -o "$PKG=[^,]*" | cut -d'=' -f2)
     

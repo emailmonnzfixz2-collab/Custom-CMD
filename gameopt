@@ -99,7 +99,7 @@ run_mode() {
 get_mode() {
     local PKG="$1"
     if [ -z "$PKG" ]; then
-        echo "Error: Masukkan nama package!"
+        echo "Error: missing package name!"
         return 1
     fi
     local DATA=$(settings get global "$GLOBAL_KEY" 2>/dev/null)
@@ -129,13 +129,13 @@ list_apps() {
 case "$COMMAND" in
     "set-mode"|"-m")
         run_mode $2 $3
-    ;;
+        ;;
     "get-mode"|"-g")
         get_mode $2
-    ;;
+        ;;
     "list-apps"|"-l")
         list_apps
-    ;;
+        ;;
     "help"|"-help"|"")
         echo "Game Opt Manager (gameopt) commands:"
         echo "  help"

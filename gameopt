@@ -1,144 +1,151 @@
 #!/system/bin/sh
 
-# ----------------- CONFIG & INITIALIZATION -----------------
 COMMAND="$1"
 SDK=$(getprop ro.build.version.sdk)
 GLOBAL_KEY="database"
+
+fetch_target_info() {
+    local PKG="$1"
+    pm list packages | grep -qw "package:$PKG" || return 1
+    dumpsys package "$PKG" | sed -n 's/.*userId=\([0-9]*\).*/\1/p' | head -n 1
+}
+
+sync_registry() {
+    local TARGET_PKG="$1"
+    local MODE="$2"
+    local CURRENT_RAW=$(settings get global "$GLOBAL_KEY" | sed 's/null//')
+    local REBUILT_DATA=""
+    local OLD_IFS="$IFS"
+    IFS=','
+    for entry in $CURRENT_RAW; do
+        [ -z "$entry" ] && continue
+        
+        local ITEM_PKG=$(echo "$entry" | cut -d'=' -f1)
+        local ITEM_MODE=$(echo "$entry" | cut -d'=' -f2)
+        if pm list packages | grep -qw "package:$ITEM_PKG" && [ "$ITEM_PKG" != "$TARGET_PKG" ]; then
+            REBUILT_DATA="${REBUILT_DATA}${ITEM_PKG}=${ITEM_MODE},"
+        fi
+    done
+    IFS="$OLD_IFS"
+    if [ ! -z "$TARGET_PKG" ] && [ ! -z "$MODE" ]; then
+        REBUILT_DATA="${REBUILT_DATA}${TARGET_PKG}=${MODE},"
+    fi
+
+    local FINAL_DATA=$(echo "$REBUILT_DATA" | sed 's/,$//')
+    settings put global "$GLOBAL_KEY" "$FINAL_DATA"
+    echo "$FINAL_DATA"
+}
 
 run_mode() {
     local MODE="$1"
     local PKG="$2"
 
-    if [ -z "$MODE" ]; then
-        echo "Error: mode not found!"
-        return 1
-    fi
+    [ -z "$MODE" ] || [ -z "$PKG" ] && { echo "Error: missing arguments!"; return 1; }    
+    local NEW_DATA=$(sync_registry "$PKG" "$MODE")
+    local UID=$(fetch_target_info "$PKG")
+    [ -z "$UID" ] && { echo "Error: Package '$PKG' not found in device!"; return 1; }
+    local PKG_LIST=$(echo "$NEW_DATA" | tr ',' '\n' | grep "=" | cut -d'=' -f1 | paste -sd ",")
 
-    if [ -z "$PKG" ]; then
-        echo "Error: missing package name!"
-        return 1
-    fi
-
-    if ! pm list packages | grep -qw "package:$PKG"; then
-        echo "Error: Package '$PKG' not found in device!"
-        return 1
-    fi
-
-    local UID=$(dumpsys package "$PKG" | grep "userId=" | cut -d'=' -f2 | cut -d' ' -f1)
-    local DATA=$(settings get global "$GLOBAL_KEY" | sed 's/null//')
-    local CLEAN_DATA=$(echo "$DATA" | sed "s|$PKG=[^,]*|,|g; s|,,|,|g; s|^,||")
-    local NEW_DATA="${CLEAN_DATA}${PKG}=${MODE},"
-    settings put global "$GLOBAL_KEY" "$NEW_DATA"
-    local PKG_LIST=""
-    local ITEMS=$(echo "$NEW_DATA" | tr ',' ' ')
-    for entry in $ITEMS; do
-        if echo "$entry" | grep -q "="; then
-            local NAME=$(echo "$entry" | cut -d'=' -f1)
-            
-            if [ -z "$PKG_LIST" ]; then
-                PKG_LIST="$NAME"
-            else
-                PKG_LIST="$PKG_LIST,$NAME"
-            fi
+    check_and_lock() {
+        local TARGET_MODE="$1" TARGET_PKG="$2"
+        local L_PATH="/data/local/tmp/bin/.locks/${TARGET_PKG}.lock"
+        [ ! -d "/data/local/tmp/bin/.locks" ] && mkdir -p "/data/local/tmp/bin/.locks"
+        
+        if [ ! -f "$L_PATH" ] || [ "$(cat "$L_PATH")" != "$TARGET_MODE" ]; then
+            echo "$TARGET_MODE" > "$L_PATH"
+            return 0
         fi
-    done
+        return 1
+    }
+
     case "$MODE" in
         "standart"|"1")
-            cmd package compile -m verify -f "$PKG" &>/dev/null 2>&1
-            cmd appops set "$PKG" RUN_IN_BACKGROUND default >/dev/null 2>&1
-            cmd appops set "$PKG" RUN_ANY_IN_BACKGROUND default >/dev/null 2>&1
-            cmd appops set "$PKG" WAKE_LOCK default >/dev/null 2>&1
-            cmd activity set-standby-bucket "$PKG" working_set >/dev/null 2>&1
+            check_and_lock "standart" "$PKG" && {
+                cmd package reconcile-secondary-dex-files "$PKG" /dev/null 2>&1
+                cmd package compile -m speed-profile -f "$PKG" >/dev/null 2>&1
+                for opt in RUN_IN_BACKGROUND RUN_ANY_IN_BACKGROUND WAKE_LOCK; do
+                    cmd appops set "$PKG" "$opt" default >/dev/null 2>&1
+                done
+                cmd activity set-standby-bucket "$PKG" working_set >/dev/null 2>&1
+                cmd netpolicy remove restrict-background-whitelist "$UID" >/dev/null 2>&1
+                cmd netpolicy remove restrict-background-blacklist "$UID" >/dev/null 2>&1
+                cmd deviceidle whitelist -"$PKG" >/dev/null 2>&1
+            }
             cmd activity set-inactive "$PKG" true >/dev/null 2>&1
-            cmd netpolicy remove restrict-background-whitelist "$UID" >/dev/null 2>&1
-            cmd deviceidle whitelist -"$PKG" >/dev/null 2>&1
-            cmd power set-fixed-performance-mode-enabled false
-            cmd power set-adaptive-power-saver-enabled false
-            echo "Success"
+            cmd thermalservice override-status 1 >/dev/null 2>&1
+            cmd power set-fixed-performance-mode-enabled false >/dev/null 2>&1
+            cmd power set-adaptive-power-saver-enabled false >/dev/null 2>&1
+            cmd set-mode 1 >/dev/null 2>&1
             ;;
         "performance"|"2")
-            cmd package compile -m speed -f "$PKG" &>/dev/null 2>&1
-            cmd package compile --compile-layouts --secondary-dex "$PKG" >/dev/null 2>&1
-            cmd appops set "$PKG" RUN_IN_BACKGROUND allow >/dev/null 2>&1
-            cmd appops set "$PKG" RUN_ANY_IN_BACKGROUND allow >/dev/null 2>&1
-            cmd appops set "$PKG" WAKE_LOCK allow >/dev/null 2>&1
-            cmd activity set-standby-bucket "$PKG" active >/dev/null 2>&1
+            check_and_lock "performance" "$PKG" && {
+                cmd package reconcile-secondary-dex-files "$PKG" /dev/null 2>&1
+                cmd package compile -m speed -f "$PKG" >/dev/null 2>&1
+                cmd package compile --compile-layouts --secondary-dex -f "$PKG" >/dev/null 2>&1
+                for opt in RUN_IN_BACKGROUND RUN_ANY_IN_BACKGROUND WAKE_LOCK; do
+                    cmd appops set "$PKG" "$opt" allow >/dev/null 2>&1
+                done
+                cmd activity set-standby-bucket "$PKG" active >/dev/null 2>&1
+                cmd netpolicy add restrict-background-whitelist "$UID" >/dev/null 2>&1
+                cmd netpolicy remove restrict-background-blacklist "$UID" >/dev/null 2>&1
+                cmd deviceidle whitelist +"$PKG" >/dev/null 2>&1
+                
+                TARGET_PROP="game_driver_opt_in_apps"
+                [ "$SDK" -ge 31 ] && TARGET_PROP="updatable_driver_production_opt_in_apps"
+                settings put global "$TARGET_PROP" "$PKG_LIST"
+                settings put global "${TARGET_PROP%_in_apps}_out_apps" 1
+            }
             cmd activity set-inactive "$PKG" false >/dev/null 2>&1
-            cmd netpolicy add restrict-background-whitelist "$UID" >/dev/null 2>&1
-            cmd deviceidle whitelist +"$PKG" >/dev/null 2>&1
-            cmd power set-fixed-performance-mode-enabled true
-            cmd power set-adaptive-power-saver-enabled false
-            if [ "$SDK" -ge 31 ]; then
-                settings put global updatable_driver_production_opt_in_apps "$PKG_LIST"
-                settings put global updatable_driver_production_opt_out_apps 1
-            else
-                settings put global game_driver_opt_in_apps "$PKG_LIST"
-                settings put global game_driver_opt_out_apps 1
-            fi
-            echo "Success"
+            cmd power set-fixed-performance-mode-enabled true >/dev/null 2>&1
+            cmd power set-adaptive-power-saver-enabled false >/dev/null 2>&1
+            cmd set-mode 0 >/dev/null 2>&1
             ;;
         "battery"|"3")
-            cmd package compile -m space -f "$PKG" &>/dev/null 2>&1
-            cmd appops set "$PKG" RUN_IN_BACKGROUND ignore >/dev/null 2>&1
-            cmd appops set "$PKG" RUN_ANY_IN_BACKGROUND ignore >/dev/null 2>&1
-            cmd appops set "$PKG" WAKE_LOCK ignore >/dev/null 2>&1
-            cmd activity set-standby-bucket "$PKG" rare >/dev/null 2>&1
+            check_and_lock "battery" "$PKG" && {
+                cmd package compile -m verify -f "$PKG" >/dev/null 2>&1
+                for opt in RUN_IN_BACKGROUND RUN_ANY_IN_BACKGROUND WAKE_LOCK; do
+                    cmd appops set "$PKG" "$opt" ignore >/dev/null 2>&1
+                done
+                cmd activity set-standby-bucket "$PKG" rare >/dev/null 2>&1
+                cmd netpolicy remove restrict-background-whitelist "$UID" >/dev/null 2>&1
+                cmd netpolicy add restrict-background-blacklist "$UID" >/dev/null 2>&1
+                cmd deviceidle whitelist -"$PKG" >/dev/null 2>&1
+            }
             cmd activity set-inactive "$PKG" true >/dev/null 2>&1
-            cmd netpolicy remove restrict-background-whitelist "$UID" >/dev/null 2>&1
-            cmd deviceidle whitelist -"$PKG" >/dev/null 2>&1
-            cmd power set-fixed-performance-mode-enabled false
-            cmd power set-adaptive-power-saver-enabled true
-            echo "Success"
+            cmd thermalservice override-status 1 >/dev/null 2>&1
+            cmd power set-fixed-performance-mode-enabled false >/dev/null 2>&1
+            cmd power set-adaptive-power-saver-enabled true >/dev/null 2>&1
+            cmd set-mode 1 >/dev/null 2>&1
             ;;
         *)
             echo "Unknown mode $MODE!, Please usage [1|2|3|standart|performance|battery]"
+            return 1
             ;;
-        esac
+    esac
+    echo "Success"
 }
 
-get_mode() {
-    local PKG="$1"
-    if [ -z "$PKG" ]; then
-        echo "Error: missing package name!"
-        return 1
-    fi
-    if ! pm list packages | grep -qw "package:$PKG"; then
-        echo "Error: Package '$PKG' not found in device!"
-        return 1
-    fi
-    local DATA=$(settings get global "$GLOBAL_KEY" 2>/dev/null)
-    local VAL=$(echo "$DATA" | grep -o "$PKG=[^,]*" | cut -d'=' -f2)
-    
-    if [ -z "$VAL" ]; then
-        echo "No profil for $PKG"
-    else
-        echo "$PKG: $VAL"
-    fi
-}
-
-list_apps() {
-    echo "Optimized Packages:"
-    local DATA=$(settings get global $GLOBAL_KEY 2>/dev/null)
-    if [ -z "$DATA" ] || [ "$DATA" = "null" ]; then
-        echo "  (None)"
-    else
-        echo "$DATA" | tr ',' '\n' | grep "=" | while read -r line; do
-            if [ -n "$line" ]; then
-                echo "  - ${line%=*} [${line#*=}]"
-            fi
-        done
-    fi
-}
-
+# --- INTERFACE COMMANDS ---
 case "$COMMAND" in
     "set-mode"|"-m")
-        run_mode $2 $3
+        run_mode "$2" "$3"
         ;;
     "get-mode"|"-g")
-        get_mode $2
+        [ -z "$2" ] && echo "Error: missing package name!" && exit 1
+        CLEAN_DB=$(sync_registry "" "")
+        RESULT=$(echo "$CLEAN_DB" | grep -o "$2=[^,]*" | cut -d'=' -f2)
+        [ -z "$RESULT" ] && echo "No profil for $2" || echo "$2: $RESULT"
         ;;
     "list-apps"|"-l")
-        list_apps
+        echo "Optimized Packages:"
+        RAW_DB=$(sync_registry "" "")
+        if [ -z "$RAW_DB" ]; then 
+            echo "  (None)"
+        else
+            echo "$RAW_DB" | tr ',' '\n' | grep "=" | while read -r entry; do
+                echo "- ${entry%=*} [${entry#*=}]"
+            done
+        fi
         ;;
     "help"|"-help"|"")
         echo "Game Opt Manager (gameopt) commands:"
@@ -162,4 +169,4 @@ case "$COMMAND" in
     *)
         echo "Unknown gameopt command: $1"
         ;;
-    esac
+esac
